@@ -1,0 +1,7 @@
+.vscode
+out/
+cache/
+node_modules/
+.env
+#lib/
+artifacts/

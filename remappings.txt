@@ -1,0 +1,13 @@
+@openzeppelin/=lib/openzeppelin-contracts/
+@uniswap/v2-core/=lib/v2-core/
+@uniswap/v2-periphery/=lib/v2-periphery/
+ds-test/=lib/ds-test/src/
+erc4626-tests/=lib/openzeppelin-contracts/lib/erc4626-tests/
+forge-std/=lib/forge-std/src/
+gnosis/=lib/safe-contracts/contracts/
+openzeppelin-contracts/=lib/openzeppelin-contracts/contracts/
+safe-contracts/=lib/safe-contracts/contracts/
+solmate/=lib/solmate/src/
+v2-core/=lib/v2-core/contracts/
+v2-periphery/=lib/v2-periphery/contracts/
+weird-erc20/=lib/solmate/lib/weird-erc20/src/
