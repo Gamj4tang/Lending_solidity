@@ -142,6 +142,7 @@ contract DreamAcademyLending is Ownable, IDreamAcademyLending {
         uint256 ethCollateral = userBalance.ethCollateral;
         uint256 ltvRatio = (debt * 100 * 1 ether) / (ethCollateral * priceOracle.getPrice(address(0)));
     
+        // research 🥲
         uint256 amountToRepay;
         if (ltvRatio >= 75 * 1 ether && ltvRatio < 51 * 1 ether) {
             amountToRepay = debt / 2;
