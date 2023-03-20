@@ -67,14 +67,14 @@ contract DreamAcademyLending is Ownable, IDreamAcademyLending {
             
             UserBalance storage userBalance = userBalances[msg.sender];
 
-            // console.log("userBalance.usdcDeposit", userBalance.usdcDeposit);
-            // console.log("userBalance.usdcDepositLastBlockNumber", userBalance.usdcDepositLastBlockNumber);
-            // console.log("block.number", block.number);
+            console.log("userBalance.usdcDeposit", userBalance.usdcDeposit);
+            console.log("userBalance.usdcDepositLastBlockNumber", userBalance.usdcDepositLastBlockNumber);
+            console.log("block.number", block.number);
         
-            // uint256 interest = calculateInterest(userBalance.usdcDeposit, userBalance.usdcDepositLastBlockNumber, block.number);
-            // console.log("interest", interest);
-            // userBalance.usdcDeposit += interest + amount;
-            userBalance.usdcDeposit  + amount;
+            uint256 interest = calculateInterest(userBalance.usdcDeposit, userBalance.usdcDepositLastBlockNumber, block.number);
+            console.log("interest", interest);
+            userBalance.usdcDeposit += interest + amount;
+            // userBalance.usdcDeposit + amount;
             userBalance.usdcDepositLastBlockNumber = block.number;
     
             usdc.safeTransferFrom(msg.sender, address(this), amount);
