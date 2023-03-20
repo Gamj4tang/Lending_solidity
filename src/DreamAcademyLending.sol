@@ -5,6 +5,7 @@ import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
+import "forge-std/console.sol";
 import "./interfaces/IDreamAcademyLending.sol";
 
 interface IPriceOracle {
@@ -21,7 +22,11 @@ contract DreamAcademyLending is Ownable, IDreamAcademyLending {
     struct UserBalance {
         uint256 ethCollateral;
         uint256 usdcDebt;
+        uint256 lastBlockNumber;
+        uint256 usdcDeposit;
+        uint256 usdcDepositLastBlockNumber;
     }
+    
 
     mapping(address => UserBalance) public userBalances;
     uint256 public ethReserve;
@@ -30,6 +35,7 @@ contract DreamAcademyLending is Ownable, IDreamAcademyLending {
     uint256 public constant INTEREST_RATE = 1001; // 24-hour interest rate of 0.1% compounded
     uint256 public constant LTV = 50; // 50% Loan-to-Value ratio
     uint256 public constant LIQUIDATION_THRESHOLD = 75; // 75% Liquidation threshold
+
 
     event Deposit(address indexed user, address indexed token, uint256 amount);
     event Withdraw(address indexed user, address indexed token, uint256 amount);
@@ -40,6 +46,7 @@ contract DreamAcademyLending is Ownable, IDreamAcademyLending {
     constructor(IPriceOracle _priceOracle, address _usdc) {
         priceOracle = _priceOracle;
         usdc = IERC20(_usdc);
+
     }
 
     function initializeLendingProtocol(address _usdc) external payable onlyOwner {
@@ -48,8 +55,6 @@ contract DreamAcademyLending is Ownable, IDreamAcademyLending {
         usdc.safeTransferFrom(msg.sender, address(this), 1); // Set initial USDC reserve to 1
         usdcReserve = 1;
     }
-
-    // @Gamj4tang state variables, side-effects change!
     function deposit(address tokenAddress, uint256 amount) external payable {
         if (tokenAddress == address(0)) {
             require(msg.value > 0, "ETH deposit amount must be greater than 0");
@@ -59,35 +64,185 @@ contract DreamAcademyLending is Ownable, IDreamAcademyLending {
             emit Deposit(msg.sender, tokenAddress, msg.value);
         } else {
             require(amount > 0, "Token deposit amount must be greater than 0");
+            
+            UserBalance storage userBalance = userBalances[msg.sender];
+
+            // console.log("userBalance.usdcDeposit", userBalance.usdcDeposit);
+            // console.log("userBalance.usdcDepositLastBlockNumber", userBalance.usdcDepositLastBlockNumber);
+            // console.log("block.number", block.number);
+        
+            // uint256 interest = calculateInterest(userBalance.usdcDeposit, userBalance.usdcDepositLastBlockNumber, block.number);
+            // console.log("interest", interest);
+            // userBalance.usdcDeposit += interest + amount;
+            userBalance.usdcDeposit  + amount;
+            userBalance.usdcDepositLastBlockNumber = block.number;
+    
             usdc.safeTransferFrom(msg.sender, address(this), amount);
             usdcReserve += amount;
             emit Deposit(msg.sender, tokenAddress, amount);
         }
     }
-
+    
     function borrow(address tokenAddress, uint256 amount) external {
         require(tokenAddress == address(usdc), "Only USDC can be borrowed");
-        //?
+        uint256 ethCollateral = userBalances[msg.sender].ethCollateral;
+        uint256 maxBorrow = _getMaxBorrowAmount(ethCollateral);
+        require(amount <= maxBorrow, "Not enough collateral to borrow this amount");
+        uint256 maxBorrowAddress = _getMaxBorrowCurrentDebtCheck(msg.sender);
+        require(amount <= maxBorrowAddress, "Not enough collateral to borrow this amount");
+    
+        UserBalance storage userBalance = userBalances[msg.sender];
+        userBalance.lastBlockNumber = block.number;
+    
+        // Add new debt
+        userBalances[msg.sender].usdcDebt += amount;
+        usdcReserve -= amount;
+        usdc.safeTransfer(msg.sender, amount);
+        emit Borrow(msg.sender, tokenAddress, amount);
     }
+    
 
+    // interest rate => 1.001 = 0.1% per day => 0.1% per 24 hours (block.number check)
     function repay(address tokenAddress, uint256 amount) external {
+        require(tokenAddress == address(usdc), "Only USDC repayment is supported");
+        require(amount > 0, "Repay amount must be greater than 0");
+        UserBalance storage userBalance = userBalances[msg.sender];
+        
+        console.log("userBalance.usdcDebt", userBalance.usdcDebt);
+        console.log("userBalance.lastBlockNumber", userBalance.lastBlockNumber);
+        console.log("block.number", block.number);
 
+        uint256 interest = calculateInterest(userBalance.usdcDebt, userBalance.lastBlockNumber, block.number);
+        console.log("interest", interest);
+        userBalance.usdcDebt += interest;
+        userBalance.lastBlockNumber = block.number;
+        // require(userBalance.usdcDebt >= amount, "Repay amount exceeds debt");
+        if (userBalance.usdcDebt < amount) {
+            userBalance.usdcDebt = 0;
+        } else {
+            userBalance.usdcDebt -= amount;
+        }
+
+        // userBalances[msg.sender].usdcDebt -= amount;
+        usdc.safeTransferFrom(msg.sender, address(this), amount);
+        
+        emit Repay(msg.sender, tokenAddress, amount);
     }
-
     function liquidate(address user, address tokenAddress, uint256 amount) external {
-
+        require(tokenAddress == address(usdc), "Only USDC can be used to liquidate");
+        require(!isHealthy(user), "Cannot liquidate a healthy user");
+    
+        UserBalance storage userBalance = userBalances[user];
+    
+        uint256 interest = calculateInterest(userBalance.usdcDebt, userBalance.lastBlockNumber, block.number);
+        userBalance.usdcDebt += interest;
+        userBalance.lastBlockNumber = block.number;
+    
+        uint256 debt = userBalance.usdcDebt;
+        uint256 ethCollateral = userBalance.ethCollateral;
+        uint256 ltvRatio = (debt * 100 * 1 ether) / (ethCollateral * priceOracle.getPrice(address(0)));
+    
+        uint256 amountToRepay;
+        if (ltvRatio >= 75 * 1 ether && ltvRatio < 51 * 1 ether) {
+            amountToRepay = debt / 2;
+        } else if (ltvRatio < 50 * 1 ether) {
+            amountToRepay = (debt * 45) / 100;
+        } else {
+            revert("Invalid LTV ratio");
+        }
+    
+        require(amount <= amountToRepay, "Cannot liquidate more than allowed amount");
+    
+        if (debt >= 100 * 1 ether) {
+            uint256 maxAmountToLiquidate = (debt * 25) / 100;
+            require(amount <= maxAmountToLiquidate, "Cannot liquidate more than 25% at once");
+        }
+    
+        bool success = usdc.transferFrom(msg.sender, address(this), amount);
+        require(success, "USDC transfer failed");
+        userBalance.usdcDebt -= amount;
+        uint256 ethAmountToTransfer = (ethCollateral * amount) / debt;
+        userBalance.ethCollateral -= ethAmountToTransfer;
+    
+        (success, ) = msg.sender.call{value: ethAmountToTransfer}("");
+        require(success, "ETH transfer failed");
+    
+        emit Liquidate(user, tokenAddress, amount);
     }
-
+    
+    
+    
     function withdraw(address tokenAddress, uint256 amount) external {
+        require(amount > 0, "Withdraw amount must be greater than 0");
+    
+        if (tokenAddress == address(0)) {
+            UserBalance storage userBalance = userBalances[msg.sender];
+            uint256 totalCollateralInEth = userBalance.ethCollateral;
+            uint256 totalDebtInEth = getTotalDebtInEth(msg.sender);
+    
+            require(totalCollateralInEth * LIQUIDATION_THRESHOLD > totalDebtInEth * 100, "Not enough collateral to withdraw");
+            require(totalCollateralInEth >= amount, "Not enough collateral to withdraw the requested amount");
+    
+            userBalance.ethCollateral -= amount;
+            ethReserve -= amount;
+            payable(msg.sender).transfer(amount);
+            emit Withdraw(msg.sender, tokenAddress, amount);
+        } else {
+            UserBalance storage userBalance = userBalances[msg.sender];
+            uint256 interest = calculateInterest(userBalance.usdcDeposit, userBalance.usdcDepositLastBlockNumber, block.number);
+            userBalance.usdcDeposit += interest;
+            userBalance.usdcDepositLastBlockNumber = block.number;
+    
+            require(userBalance.usdcDeposit >= amount, "Not enough deposit to withdraw the requested amount");
+    
+            userBalance.usdcDeposit -= amount;
+            usdcReserve -= amount;
+            usdc.safeTransfer(msg.sender, amount);
+            emit Withdraw(msg.sender, tokenAddress, amount);
+        }
     }
 
+    /**
+     * Utils
+     */
+    function _getMaxBorrowAmount(uint256 collateral) internal view returns (uint256) {
+        uint256 colateralValueInUsdc = (collateral * priceOracle.getPrice(address(0))) / 1e18;
+        return (colateralValueInUsdc * LTV) / 100;
+    }
 
-    // ?
+    function _getMaxBorrowCurrentDebtCheck(address user) internal view returns (uint256) {
+        uint256 ethCollateral = userBalances[user].ethCollateral;
+        uint256 collateralValueInUsdc = (ethCollateral * priceOracle.getPrice(address(0))) / 1e18;
+        uint256 maxBorrowAmount = (collateralValueInUsdc * LTV) / 100;
+        uint256 currentDebt = userBalances[user].usdcDebt;
 
-    // getters, any ?
+        return maxBorrowAmount > currentDebt ? maxBorrowAmount - currentDebt : 0;
+    }
+
+    function isHealthy(address user) public view returns (bool) {
+        uint256 currentDebt = userBalances[user].usdcDebt;
+        uint256 ethCollateral = userBalances[user].ethCollateral;
+        uint256 maxBorrowAmount = _getMaxBorrowAmount(ethCollateral);
+    
+        return currentDebt <= maxBorrowAmount;
+    }
+    function calculateInterest(uint256 debt, uint256 lastBlockNumber, uint256 currentBlockNumber) public view returns (uint256) {
+        uint256 blockDistance = currentBlockNumber - lastBlockNumber;
+        uint256 interest = (debt * ((INTEREST_RATE ** blockDistance) - 1)) / (10 ** 18);
+        return interest;
+    }
+    
+    function getTotalDebtInEth(address user) public view returns (uint256) {
+        UserBalance storage userBalance = userBalances[user];
+        uint256 interest = calculateInterest(userBalance.usdcDebt, userBalance.lastBlockNumber, block.number);
+        uint256 totalDebtInUsdc = userBalance.usdcDebt + interest;
+        return (totalDebtInUsdc * priceOracle.getPrice(address(usdc))) / 1 ether;
+    }
+
+    // getters, any ? serch.....
     // lending.getAccruedSupplyAmount(address(usdc)) / 1e18 == 30000792);
     function getAccruedSupplyAmount(address tokenAddress) external view returns (uint256) {
-        return 0;
+        return 1e18;
     }
 }
 
