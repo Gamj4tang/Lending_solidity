@@ -513,8 +513,13 @@ contract Testx is Test {
         }
         vm.stopPrank();
 
+        // emit log_named_uint("getAccruedSupplyAmount", lending.getAccruedSupplyAmount(address(usdc)) / 1e18); // 1
         vm.roll(block.number + (86400 * 1000 / 12));
+        // emit log_named_uint("getAccruedSupplyAmount", lending.getAccruedSupplyAmount(address(usdc)) / 1e18); // 2
         vm.prank(user3);
+
+        // emit log_named_uint("getAccruedSupplyAmount", lending.getAccruedSupplyAmount(address(usdc)) / 1e18); // 2
+        
         assertTrue(lending.getAccruedSupplyAmount(address(usdc)) / 1e18 == 30000792);
 
         // other lender deposits USDC to our protocol.
@@ -533,7 +538,7 @@ contract Testx is Test {
 
         vm.prank(user1);
         uint256 c = lending.getAccruedSupplyAmount(address(usdc));
-
+        
         assertEq((a + b + c) / 1e18 - 30000000 - 10000000 - 100000000, 6956);
         assertEq(a / 1e18 - 30000000, 1547);
         assertEq(b / 1e18 - 10000000, 251);
