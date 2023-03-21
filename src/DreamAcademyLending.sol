@@ -1,37 +1,52 @@
+// SPDX-License-Identifier: MIT
 pragma solidity 0.8.13;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
 
-import "forge-std/console.sol";
 import "./interfaces/IDreamAcademyLending.sol";
+import "./FixedPointMathLib.sol";
+import "forge-std/console.sol";
 
 interface IPriceOracle {
     function getPrice(address token) external view returns (uint256);
     function setPrice(address token, uint256 price) external;
 }
 
-contract DreamAcademyLending is Ownable, IDreamAcademyLending {
+contract DreamAcademyLending is Ownable, IDreamAcademyLending,ReentrancyGuard {
     using SafeERC20 for IERC20;
+    using SafeMath for uint256;
+    using FixedPointMathLib for uint256;
 
     IPriceOracle public priceOracle;
-    IERC20 public usdc; 
+    address public usdc; 
+    
     struct UserBalance {
-        uint256 balances;
+        uint256 balance;
         uint256 debt;
         uint256 collateral;
-        uint256 blocknum;
+        uint256 blockNum;
+        uint256 reserves;
+    }
+    struct Update {
+        uint256 interestRate;
+        uint256 cacheinterestRate;
+        address[] actors;
     }
 
+    Update public update;
     mapping(address => UserBalance) public userBalances;
-    // anything...?
-    uint256 public constant INTEREST_RATE = 1001; // 24-hour interest rate of 0.1% compounded
+    
+    uint256 public constant INTEREST_RATE = 1e15; // 24-hour interest rate of 0.1% compounded
     uint256 public constant LTV = 50; // 50% Loan-to-Value ratio
-    uint256 public constant LIQUIDATION_THRESHOLD = 75; // 75% Liquidation threshold
-
-
+    uint256 public constant LIQUIDATION_THRESHOLD = 75; // LIQUIDATION_THRESHOLD% Liquidation threshold
+    uint256 public constant BLOCKS_PER_DAY = 7200; // 7200 blocks per day
+    uint256 public constant WAD = 10**18; // FixedPointMathLib's WAD constant
+    
     event Deposit(address indexed user, address indexed token, uint256 amount);
     event Withdraw(address indexed user, address indexed token, uint256 amount);
     event Borrow(address indexed user, address indexed token, uint256 amount);
@@ -40,41 +55,33 @@ contract DreamAcademyLending is Ownable, IDreamAcademyLending {
 
     constructor(IPriceOracle _priceOracle, address _usdc) {
         priceOracle = _priceOracle;
-        usdc = IERC20(_usdc);
-
+        usdc = _usdc;
     }
 
     function initializeLendingProtocol(address _usdc) external payable onlyOwner {
         require(msg.value > 0, "ETH reserve must be greater than 0");
         // ethReserve = msg.value;
-        usdc.safeTransferFrom(msg.sender, address(this), 1); // Set initial USDC reserve to 1
+        IERC20(_usdc).safeTransferFrom(msg.sender, address(this), 1); // Set initial USDC reserve to 1
         // usdcReserve = 1;
     }
-    function deposit(address tokenAddress, uint256 amount) external payable {
+
+    function deposit(address tokenAddress, uint256 amount) external payable nonReentrant {
         if (tokenAddress == address(0)) {
             require(msg.value > 0, "ETH deposit amount must be greater than 0");
             require(msg.value >= amount, "ETH deposit amount must be greater than or equal to msg.value");
-            userBalances[msg.sender].collateral += msg.value;
-            // ethReserve += msg.value;
-            emit Deposit(msg.sender, tokenAddress, msg.value);
+            userBalances[msg.sender].collateral+=amount;
+            emit Deposit(msg.sender, tokenAddress, amount);
         } else {
             require(amount > 0, "Token deposit amount must be greater than 0");
-            
-            UserBalance storage userBalance = userBalances[msg.sender];
-        
-            // uint256 interest = calculateInterest(userBalance.usdcDeposit, userBalance.usdcDepositLastBlockNumber, block.number);
-            // console.log("interest", interest);
-            userBalance.balances += amount;
-            // userBalance.usdcDeposit + amount;
-            // userBalance.blocknum = block.number;
-    
-            usdc.safeTransferFrom(msg.sender, address(this), amount);
-            // usdcReserve += amount;
+            updateSystem(usdc);
+            userBalances[msg.sender].balance += amount;
+            update.actors.push(msg.sender);
+            ERC20(usdc).transferFrom(msg.sender, address(this), amount);
             emit Deposit(msg.sender, tokenAddress, amount);
         }
     }
-    
-    function borrow(address tokenAddress, uint256 amount) external {
+
+    function borrow(address tokenAddress, uint256 amount) external payable nonReentrant{
         require(tokenAddress == address(usdc), "Only USDC can be borrowed");
         uint256 ethCollateral = userBalances[msg.sender].collateral;
         uint256 maxBorrow = _getMaxBorrowAmount(ethCollateral);
@@ -82,162 +89,172 @@ contract DreamAcademyLending is Ownable, IDreamAcademyLending {
         uint256 maxBorrowAddress = _getMaxBorrowCurrentDebtCheck(msg.sender);
         require(amount <= maxBorrowAddress, "Not enough collateral to borrow this amount");
     
-        UserBalance storage userBalance = userBalances[msg.sender];
-        userBalance.blocknum = block.number;
-    
-        // Add new debt
-        userBalance.debt += amount;
-        // usdcReserve -= amount;
-        usdc.safeTransfer(msg.sender, amount);
+        (uint256 _oETH, uint256 _oUSDC) = _getCurrentPrices();
+        
+        require(_oETH.mul(userBalances[msg.sender].collateral).div(2) >= _oUSDC.mul(userBalances[msg.sender].debt).add(amount), "Not enough collateral to borrow this amount");
+        ERC20(usdc).transfer(msg.sender, amount);
+        userBalances[msg.sender].debt += amount;
+        userBalances[msg.sender].blockNum = block.number;
+        update.actors.push(msg.sender);
         emit Borrow(msg.sender, tokenAddress, amount);
     }
-    
 
-    // interest rate => 1.001 = 0.1% per day => 0.1% per 24 hours (block.number check)
-    function repay(address tokenAddress, uint256 amount) external {
+    function repay(address tokenAddress, uint256 amount) external payable nonReentrant{
         require(tokenAddress == address(usdc), "Only USDC repayment is supported");
         require(amount > 0, "Repay amount must be greater than 0");
-        UserBalance storage userBalance = userBalances[msg.sender];
         
-        console.log("userBalance.usdcDebt", userBalance.debt);
-        console.log("userBalance.lastBlockNumber", userBalance.blocknum);
-        console.log("block.number", block.number);
-
-        uint256 interest = calculateInterest(userBalance.debt, userBalance.blocknum, block.number);
-        console.log("interest", interest);
-        userBalance.debt += interest;
-        userBalance.blocknum = block.number;
-        // require(userBalance.usdcDebt >= amount, "Repay amount exceeds debt");
-        // if (userBalance.debt < amount) {
-        //     userBalance.debt = 0;
-        // } else {
-        //     userBalance.debt -= amount;
-        // }
-
-        // userBalances[msg.sender].usdcDebt -= amount;
-        userBalance.debt -= amount;
-        usdc.safeTransferFrom(msg.sender, address(this), amount);
-        
+        _calculateInterest(msg.sender);
+        userBalances[msg.sender].debt -= amount;
+        ERC20(usdc).transferFrom(msg.sender, address(this), amount);
         emit Repay(msg.sender, tokenAddress, amount);
     }
-    function liquidate(address user, address tokenAddress, uint256 amount) external {
-        require(tokenAddress == address(usdc), "Only USDC can be used to liquidate");
-        require(!isHealthy(user), "Cannot liquidate a healthy user");
-    
-        UserBalance storage userBalance = userBalances[user];
-    
-        // uint256 interest = calculateInterest(userBalance.usdcDebt, userBalance.lastBlockNumber, block.number);
-        // userBalance.usdcDebt += interest;
-        // userBalance.lastBlockNumber = block.number;
-    
-        uint256 debt = userBalance.debt;
-        uint256 ethCollateral = userBalance.collateral;
-        uint256 ltvRatio = (debt * 100 * 1 ether) / (ethCollateral * priceOracle.getPrice(address(0)));
-    
-        // research 🥲
-        uint256 amountToRepay;
-        if (ltvRatio >= 75 * 1 ether && ltvRatio < 51 * 1 ether) {
-            amountToRepay = debt / 2;
-        } else if (ltvRatio < 50 * 1 ether) {
-            amountToRepay = (debt * 45) / 100;
-        } else {
-            revert("Invalid LTV ratio");
-        }
-    
-        require(amount <= amountToRepay, "Cannot liquidate more than allowed amount");
-    
-        if (debt >= 100 * 1 ether) {
-            uint256 maxAmountToLiquidate = (debt * 25) / 100;
-            require(amount <= maxAmountToLiquidate, "Cannot liquidate more than 25% at once");
-        }
-    
-        bool success = usdc.transferFrom(msg.sender, address(this), amount);
-        require(success, "USDC transfer failed");
-        userBalance.debt -= amount;
-        uint256 ethAmountToTransfer = (ethCollateral * amount) / debt;
-        userBalance.collateral -= ethAmountToTransfer;
 
+    function liquidate(address user, address tokenAddress, uint256 amount) external nonReentrant{
+        require(tokenAddress == address(usdc), "Only USDC can be used to liquidate");
+        require(!_isHealthy(user), "Cannot liquidate a healthy user");
+
+        (uint256 _oETH, uint256 _oUSDC) = _getCurrentPrices();
+        require((_oETH * userBalances[user].collateral * LIQUIDATION_THRESHOLD).div(100) < userBalances[user].debt.mul(_oUSDC), "Cannot liquidate a healthy user");
+        require((userBalances[user].debt * 25).div(100) >= amount, "Cannot liquidate a healthy user");
+
+        uint256 ethAmountToTransfer = amount * userBalances[user].collateral.div(userBalances[user].debt);
+        ERC20(usdc).transferFrom(msg.sender, address(this), amount);
         payable(msg.sender).transfer(ethAmountToTransfer);
-    
+        userBalances[user].debt -= amount;
         emit Liquidate(user, tokenAddress, amount);
     }
-    
-    
-    
-    function withdraw(address tokenAddress, uint256 amount) external {
+
+    function withdraw(address tokenAddress, uint256 amount) external nonReentrant{
+        // @Gamj4tang withdraw normal check
         require(amount > 0, "Withdraw amount must be greater than 0");
-    
+        require(userBalances[msg.sender].balance != 0 || userBalances[msg.sender].collateral != 0, "User has no balance to withdraw");
+        _calculateInterest(msg.sender);
         if (tokenAddress == address(0)) {
-            UserBalance storage userBalance = userBalances[msg.sender];
-            uint256 totalCollateralInEth = userBalance.collateral;
-            uint256 totalDebtInEth = getTotalDebtInEth(msg.sender);
-    
-            require(totalCollateralInEth * LIQUIDATION_THRESHOLD > totalDebtInEth * 100, "Not enough collateral to withdraw");
-            require(totalCollateralInEth >= amount, "Not enough collateral to withdraw the requested amount");
-    
-            userBalance.collateral -= amount;
-            // ethReserve -= amount;
-            payable(msg.sender).transfer(amount);
-            emit Withdraw(msg.sender, tokenAddress, amount);
+            if (userBalances[msg.sender].debt == 0) {
+                payable(msg.sender).transfer(amount);
+                userBalances[msg.sender].collateral -= amount;
+            } else {
+                (uint256 _oETH, uint256 _oUSDC) = _getCurrentPrices();
+                // @Gamj4tang withdraw threshold check
+                require(((_oETH.mul((userBalances[msg.sender].collateral.sub(amount)))) * LIQUIDATION_THRESHOLD).div(100) > userBalances[msg.sender].debt.mul(_oUSDC));
+                payable(msg.sender).transfer(amount);
+                userBalances[msg.sender].collateral -= amount;
+            }
+
         } else {
-            UserBalance storage userBalance = userBalances[msg.sender];
-            uint256 interest = calculateInterest(userBalance.balances, userBalance.blocknum, block.number);
-            userBalance.balances += interest;
-            userBalance.blocknum = block.number;
-    
-            require(userBalance.balances >= amount, "Not enough deposit to withdraw the requested amount");
-    
-            userBalance.balances -= amount;
-            // usdcReserve -= amount;
-            usdc.safeTransfer(msg.sender, amount);
-            emit Withdraw(msg.sender, tokenAddress, amount);
+            amount = getAccruedSupplyAmount(tokenAddress) / WAD * WAD;
+            userBalances[msg.sender].balance += amount - userBalances[msg.sender].balance;
+            ERC20(usdc).transfer(msg.sender, amount);
+            userBalances[msg.sender].balance -= amount;
         }
+        emit Withdraw(msg.sender, tokenAddress, amount);
     }
 
-    /**
-     * Utils
-     */
+    function _getCurrentPrices() internal view returns (uint256 ethPrice, uint256 usdcPrice) {
+        ethPrice = priceOracle.getPrice(address(0x0));
+        usdcPrice = priceOracle.getPrice(usdc);
+    }
+    
     function _getMaxBorrowAmount(uint256 collateral) internal view returns (uint256) {
-        uint256 colateralValueInUsdc = (collateral * priceOracle.getPrice(address(0))) / 1e18;
+        uint256 colateralValueInUsdc = (collateral.mul(priceOracle.getPrice(address(0)))).div(1e18);
         return (colateralValueInUsdc * LTV) / 100;
     }
 
     function _getMaxBorrowCurrentDebtCheck(address user) internal view returns (uint256) {
         uint256 ethCollateral = userBalances[user].collateral;
-        uint256 collateralValueInUsdc = (ethCollateral * priceOracle.getPrice(address(0))) / 1e18;
-        uint256 maxBorrowAmount = (collateralValueInUsdc * LTV) / 100;
+        uint256 collateralValueInUsdc = (ethCollateral.mul(priceOracle.getPrice(address(0)))).div(1e18);
+        uint256 maxBorrowAmount = (collateralValueInUsdc.mul(LTV)).div(100);
         uint256 currentDebt = userBalances[user].debt;
 
         return maxBorrowAmount > currentDebt ? maxBorrowAmount - currentDebt : 0;
     }
 
-    function isHealthy(address user) public view returns (bool) {
+    function _isHealthy(address user) internal view returns (bool) {
         uint256 currentDebt = userBalances[user].debt;
         uint256 ethCollateral = userBalances[user].collateral;
         uint256 maxBorrowAmount = _getMaxBorrowAmount(ethCollateral);
     
         return currentDebt <= maxBorrowAmount;
     }
-    function calculateInterest(uint256 debt, uint256 lastBlockNumber, uint256 currentBlockNumber) public view returns (uint256) {
-        uint256 blockDistance = currentBlockNumber - lastBlockNumber;
-        uint256 interest = (debt * ((INTEREST_RATE ** blockDistance) - 1)) / (10 ** 18);
-        return interest;
-    }
-    
-    function getTotalDebtInEth(address user) public view returns (uint256) {
-        UserBalance storage userBalance = userBalances[user];
-        uint256 interest = calculateInterest(userBalance.debt, userBalance.blocknum, block.number);
-        uint256 totalDebtInUsdc = userBalance.debt + interest;
-        return (totalDebtInUsdc * priceOracle.getPrice(address(usdc))) / 1 ether;
+    /**
+        // rate : 0.1% => 0.001
+        // block finality : 12s => (1 per 12s)
+        // 24 hours => 7200 block
+
+        // A * (1 + r) ** n 
+
+        // -> 1 block  => Compound Calc
+        // A * (1 + 0.001) ** 7200
+        // r = (1.001)**(1/7200)-1
+
+        // -> debt, 24 hours 0.1% compound interest rate
+        // r = (1 + 0.001)**(1/7200)-1
+
+        // ex)
+        // debt = 1000
+        // block_distance = 1000
+
+        // => debt * ((1 + r) ** (block_distance ))
+
+        // r = (1.001)**(1/7200)-1
+        // r = 0.00013882 => celi 
+        // uint256 interest = debt * ((1 + r) ** (blockDistance));  <= overflow check
+        // uint256 period = block.number - userBalances[_user].blockNum;
+     */
+    function _getCompoundInterest(uint256 p, uint256 r, uint256 n) internal pure returns (uint256) {
+        // A = (1 + (r / 10^18))
+        // result = p * (A)^n
+        uint256 rate = FixedPointMathLib.divWadUp(r, WAD) + FixedPointMathLib.WAD;
+        return FixedPointMathLib.mulWadUp(p, rate.rpow(n, FixedPointMathLib.WAD));
     }
 
-    function getAccruedSupplyAmount(address tokenAddress) external view returns (uint256) {
-        require(tokenAddress == address(usdc), "Only USDC is supported for accrued supply amount calculation");
-        UserBalance storage userBalance = userBalances[msg.sender];
-        uint256 interest = calculateInterest(userBalance.balances, userBalance.blocknum, block.number);
-        return userBalance.balances + interest;
+    function _calculateInterest(address _user) internal returns(uint) {
+        _getCompoundInterest(1000, 1000000000000000, 1000);
+        _getCompoundInterest(1000, 1000000000000000, 0);
+
+        _getCompoundInterest(1000, 1030000000000000, 1000);
+
+
+
+
+        uint _compound = 1E3;
+        return _compound;
+    }
+
+
+    function getAccruedSupplyAmount(address _usdc) public returns (uint256) {
+        updateSystem(address(0));
+        uint256 usdcBalance = ERC20(_usdc).balanceOf(address(this));
+        uint256 userBalance = userBalances[msg.sender].balance;
+        uint256 reserves = userBalances[msg.sender].reserves;
+        uint256 accruedInterest = (update.interestRate.sub(update.cacheinterestRate)).mul(userBalance).div(usdcBalance);
+        uint accruedSupply = userBalance.add(reserves).add(accruedInterest);
+        // console.log("interestRate", update.interestRate);
+        // console.log("cacheinterestRate", update.cacheinterestRate);
+        return accruedSupply;
+    }
+
+    function updateSystem(address _usdc) internal {
+        {
+            uint actorsLen = update.actors.length;
+            if (_usdc != address(0)) {
+                update.cacheinterestRate = update.interestRate;
+                for (uint i = 0; i < actorsLen;) {
+                    address addr = update.actors[i];
+                    userBalances[addr].reserves = (update.interestRate.mul(userBalances[addr].balance).div(ERC20(_usdc).balanceOf(address(this))));
+                    unchecked {
+                        i++;
+                    }
+                }
+            } else {
+                for (uint i = 0; i < actorsLen;) {
+                    address user = update.actors[i];
+                    update.interestRate += _calculateInterest(user);
+                    unchecked {
+                        i++;
+                    }
+                }
+            }
+        }
     }
 }
-
-
-

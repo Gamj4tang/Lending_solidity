@@ -16,8 +16,8 @@ pragma solidity 0.8.13;
 
 interface IDreamAcademyLending {
     function deposit(address tokenAddress, uint256 amount) external payable;
-    function borrow(address tokenAddress, uint256 amount) external;
-    function repay(address tokenAddress, uint256 amount) external;
+    function borrow(address tokenAddress, uint256 amount) external payable;
+    function repay(address tokenAddress, uint256 amount) external payable;
     function liquidate(address user, address tokenAddress, uint256 amount) external;
     function withdraw(address tokenAddress, uint256 amount) external;
 }
