@@ -60,9 +60,7 @@ contract DreamAcademyLending is Ownable, IDreamAcademyLending,ReentrancyGuard {
 
     function initializeLendingProtocol(address _usdc) external payable onlyOwner {
         require(msg.value > 0, "ETH reserve must be greater than 0");
-        // ethReserve = msg.value;
-        IERC20(_usdc).safeTransferFrom(msg.sender, address(this), 1); // Set initial USDC reserve to 1
-        // usdcReserve = 1;
+        IERC20(_usdc).safeTransferFrom(msg.sender, address(this), 1);
     }
 
     function deposit(address tokenAddress, uint256 amount) external payable nonReentrant {
@@ -209,18 +207,17 @@ contract DreamAcademyLending is Ownable, IDreamAcademyLending,ReentrancyGuard {
     }
 
     function _calculateInterest(address _user) internal returns(uint) {
-        _getCompoundInterest(1000, 1000000000000000, 1000);
-        _getCompoundInterest(1000, 1000000000000000, 0);
-
-        _getCompoundInterest(1000, 1030000000000000, 1000);
-
-
-
-
-        uint _compound = 1E3;
+        uint distance = block.number.sub(userBalances[_user].blockNum);
+        uint blockPerDay = distance.div(BLOCKS_PER_DAY);
+        uint blockPerDayLast = distance % BLOCKS_PER_DAY;
+        uint currentDebt = userBalances[_user].debt;
+        uint compoundInterestDebt = _getCompoundInterest(currentDebt, INTEREST_RATE, blockPerDay);
+        if (blockPerDayLast != 0) compoundInterestDebt += (_getCompoundInterest(compoundInterestDebt, INTEREST_RATE, 1).sub(compoundInterestDebt)).mul(blockPerDayLast).div(BLOCKS_PER_DAY);
+        uint256 _compound = compoundInterestDebt.sub(currentDebt);
+        userBalances[_user].debt = compoundInterestDebt;
+        userBalances[_user].blockNum = block.number;
         return _compound;
     }
-
 
     function getAccruedSupplyAmount(address _usdc) public returns (uint256) {
         updateSystem(address(0));
@@ -229,8 +226,7 @@ contract DreamAcademyLending is Ownable, IDreamAcademyLending,ReentrancyGuard {
         uint256 reserves = userBalances[msg.sender].reserves;
         uint256 accruedInterest = (update.interestRate.sub(update.cacheinterestRate)).mul(userBalance).div(usdcBalance);
         uint accruedSupply = userBalance.add(reserves).add(accruedInterest);
-        // console.log("interestRate", update.interestRate);
-        // console.log("cacheinterestRate", update.cacheinterestRate);
+
         return accruedSupply;
     }
 
