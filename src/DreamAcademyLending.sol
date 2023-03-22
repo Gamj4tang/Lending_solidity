@@ -46,6 +46,7 @@ contract DreamAcademyLending is Ownable, IDreamAcademyLending,ReentrancyGuard {
     uint256 public immutable LIQUIDATION_THRESHOLD = 75; // LIQUIDATION_THRESHOLD% Liquidation threshold
     uint256 public immutable BLOCKS_PER_DAY = 7200; // 7200 blocks per day
     uint256 public immutable WAD = 10**18; // FixedPointMathLib's WAD constant
+
     
     event Deposit(address indexed user, address indexed token, uint256 amount);
     event Withdraw(address indexed user, address indexed token, uint256 amount);
@@ -64,20 +65,22 @@ contract DreamAcademyLending is Ownable, IDreamAcademyLending,ReentrancyGuard {
     }
 
     function deposit(address tokenAddress, uint256 amount) external payable nonReentrant {
+        require(amount > 0, "Deposit amount must be greater than 0");
+    
         if (tokenAddress == address(0)) {
             require(msg.value > 0, "ETH deposit amount must be greater than 0");
             require(msg.value >= amount, "ETH deposit amount must be greater than or equal to msg.value");
-            userBalances[msg.sender].collateral+=amount;
-            emit Deposit(msg.sender, tokenAddress, amount);
+            userBalances[msg.sender].collateral += amount;
         } else {
-            require(amount > 0, "Token deposit amount must be greater than 0");
             updateSystem(usdc);
             userBalances[msg.sender].balance += amount;
             update.actors.push(msg.sender);
             ERC20(usdc).transferFrom(msg.sender, address(this), amount);
-            emit Deposit(msg.sender, tokenAddress, amount);
         }
+    
+        emit Deposit(msg.sender, tokenAddress, amount);
     }
+    
 
     function borrow(address tokenAddress, uint256 amount) external payable nonReentrant{
         require(tokenAddress == address(usdc), "Only USDC can be borrowed");
@@ -149,6 +152,7 @@ contract DreamAcademyLending is Ownable, IDreamAcademyLending,ReentrancyGuard {
         }
         emit Withdraw(msg.sender, tokenAddress, amount);
     }
+
 
     function _getCurrentPrices() internal view returns (uint256 ethPrice, uint256 usdcPrice) {
         ethPrice = priceOracle.getPrice(address(0x0));
