@@ -41,11 +41,11 @@ contract DreamAcademyLending is Ownable, IDreamAcademyLending,ReentrancyGuard {
     Update public update;
     mapping(address => UserBalance) public userBalances;
     
-    uint256 public constant INTEREST_RATE = 1e15; // 24-hour interest rate of 0.1% compounded
-    uint256 public constant LTV = 50; // 50% Loan-to-Value ratio
-    uint256 public constant LIQUIDATION_THRESHOLD = 75; // LIQUIDATION_THRESHOLD% Liquidation threshold
-    uint256 public constant BLOCKS_PER_DAY = 7200; // 7200 blocks per day
-    uint256 public constant WAD = 10**18; // FixedPointMathLib's WAD constant
+    uint256 public immutable INTEREST_RATE = 1e15; // 24-hour interest rate of 0.1% compounded
+    uint256 public immutable LTV = 50; // 50% Loan-to-Value ratio
+    uint256 public immutable LIQUIDATION_THRESHOLD = 75; // LIQUIDATION_THRESHOLD% Liquidation threshold
+    uint256 public immutable BLOCKS_PER_DAY = 7200; // 7200 blocks per day
+    uint256 public immutable WAD = 10**18; // FixedPointMathLib's WAD constant
     
     event Deposit(address indexed user, address indexed token, uint256 amount);
     event Withdraw(address indexed user, address indexed token, uint256 amount);
@@ -108,6 +108,8 @@ contract DreamAcademyLending is Ownable, IDreamAcademyLending,ReentrancyGuard {
     }
 
     function liquidate(address user, address tokenAddress, uint256 amount) external nonReentrant{
+        require(amount > 0, "Liquidation amount must be greater than 0");
+        require(msg.sender != user, "Cannot liquidate yourself");
         require(tokenAddress == address(usdc), "Only USDC can be used to liquidate");
         require(!_isHealthy(user), "Cannot liquidate a healthy user");
 
@@ -116,9 +118,9 @@ contract DreamAcademyLending is Ownable, IDreamAcademyLending,ReentrancyGuard {
         require((userBalances[user].debt * 25).div(100) >= amount, "Cannot liquidate a healthy user");
 
         uint256 ethAmountToTransfer = amount * userBalances[user].collateral.div(userBalances[user].debt);
+        userBalances[user].debt -= amount;
         ERC20(usdc).transferFrom(msg.sender, address(this), amount);
         payable(msg.sender).transfer(ethAmountToTransfer);
-        userBalances[user].debt -= amount;
         emit Liquidate(user, tokenAddress, amount);
     }
 
@@ -152,7 +154,6 @@ contract DreamAcademyLending is Ownable, IDreamAcademyLending,ReentrancyGuard {
         ethPrice = priceOracle.getPrice(address(0x0));
         usdcPrice = priceOracle.getPrice(usdc);
     }
-    
     function _getMaxBorrowAmount(uint256 collateral) internal view returns (uint256) {
         uint256 colateralValueInUsdc = (collateral.mul(priceOracle.getPrice(address(0)))).div(1e18);
         return (colateralValueInUsdc * LTV) / 100;
@@ -200,8 +201,6 @@ contract DreamAcademyLending is Ownable, IDreamAcademyLending,ReentrancyGuard {
         // uint256 period = block.number - userBalances[_user].blockNum;
      */
     function _getCompoundInterest(uint256 p, uint256 r, uint256 n) internal pure returns (uint256) {
-        // A = (1 + (r / 10^18))
-        // result = p * (A)^n
         uint256 rate = FixedPointMathLib.divWadUp(r, WAD) + FixedPointMathLib.WAD;
         return FixedPointMathLib.mulWadUp(p, rate.rpow(n, FixedPointMathLib.WAD));
     }
@@ -231,26 +230,26 @@ contract DreamAcademyLending is Ownable, IDreamAcademyLending,ReentrancyGuard {
     }
 
     function updateSystem(address _usdc) internal {
-        {
-            uint actorsLen = update.actors.length;
-            if (_usdc != address(0)) {
-                update.cacheinterestRate = update.interestRate;
-                for (uint i = 0; i < actorsLen;) {
-                    address addr = update.actors[i];
-                    userBalances[addr].reserves = (update.interestRate.mul(userBalances[addr].balance).div(ERC20(_usdc).balanceOf(address(this))));
-                    unchecked {
-                        i++;
-                    }
-                }
-            } else {
-                for (uint i = 0; i < actorsLen;) {
-                    address user = update.actors[i];
-                    update.interestRate += _calculateInterest(user);
-                    unchecked {
-                        i++;
-                    }
-                }
+        uint256 actorsLen = update.actors.length;
+        uint256 interestRate = update.interestRate;
+        
+        if (_usdc != address(0)) {
+            uint256 totalUsdcBalance = ERC20(_usdc).balanceOf(address(this));
+            uint256 cacheInterestRate = interestRate;
+            for (uint256 i = 0; i < actorsLen; i++) {
+                address addr = update.actors[i];
+                uint256 reserves = interestRate.mul(userBalances[addr].balance).div(totalUsdcBalance);
+                userBalances[addr].reserves = reserves;
+            }
+            update.cacheinterestRate = cacheInterestRate;
+        } else {
+            uint256 i = 0;
+            while (i < actorsLen) {
+                address user = update.actors[i];
+                interestRate = interestRate.add(_calculateInterest(user));
+                i++;
             }
         }
+        update.interestRate = interestRate;
     }
 }
